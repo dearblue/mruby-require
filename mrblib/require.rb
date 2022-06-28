@@ -1,7 +1,5 @@
 class LoadError < ScriptError; end
 
-$__mruby_require_toplevel_self__ = self
-
 module Kernel
   def load(path)
     raise TypeError unless path.class == String
@@ -9,8 +7,7 @@ module Kernel
     if File.exist?(path) && File.extname(path) == ".mrb"
       _load_mrb_file path
     elsif File.exist?(path)
-      # _load_rb_str File.open(path).read.to_s, path
-      $__mruby_require_toplevel_self__.eval(File.open(path).read.to_s, nil, path)
+      _load_rb_file path
     else
       raise LoadError, "File not found -- #{path}"
     end

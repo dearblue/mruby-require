@@ -1,28 +1,21 @@
-#if !(defined(_WIN32) || defined(_WIN64))
-#include <err.h>
-#endif
-#include <fcntl.h>
-#include <setjmp.h>
-#include <unistd.h>
-
 #include "mruby.h"
 #include "mruby/compile.h"
 #include "mruby/dump.h"
 #include "mruby/string.h"
 #include "mruby/proc.h"
 
-#include "opcode.h"
-#include "error.h"
+#if defined(MRUBY_RELEASE_NO) && MRUBY_RELEASE_NO >= 10100
+#include "mruby/opcode.h"
+#include "mruby/error.h"
+#else
+#include "mruby/../../src/opcode.h"
+#include "mruby/../../src/error.h"
+#define MRUBY_RELEASE_NO 0
+#endif
 
 #include <stdlib.h>
-#include <sys/stat.h>
 
 #define E_LOAD_ERROR (mrb_class_get(mrb, "LoadError"))
-
-/* We can't use MRUBY_RELEASE_NO to determine if byte code implementation is old */
-#ifdef MKOP_A
-#define USE_MRUBY_OLD_BYTE_CODE
-#endif
 
 #if MRUBY_RELEASE_NO < 10000
 mrb_value mrb_yield_internal(mrb_state *mrb, mrb_value b, int argc, mrb_value *argv, mrb_value self, struct RClass *c);
@@ -35,25 +28,26 @@ mrb_value mrb_yield_internal(mrb_state *mrb, mrb_value b, int argc, mrb_value *a
 } while (0)
 #endif
 
-#if defined(_WIN32) || defined(_WIN64)
-  #include <windows.h>
-  int mkstemp(char *template)
-  {
-    DWORD pathSize;
-    char pathBuffer[1000];
-    char tempFilename[MAX_PATH];
-    UINT uniqueNum;
-    pathSize = GetTempPath(1000, pathBuffer);
-    if (pathSize < 1000) { pathBuffer[pathSize] = 0; }
-    else                 { pathBuffer[0] = 0; }
-    uniqueNum = GetTempFileName(pathBuffer, template, 0, tempFilename);
-    if (uniqueNum == 0) return -1;
-    strncpy(template, tempFilename, MAX_PATH);
-    return open(tempFilename, _O_RDWR|_O_BINARY);
-  }
+// older than mruby-2.1.0
+#ifndef mrb_proc_p
+#define mrb_proc_p(o) (mrb_type(o) == MRB_TT_PROC)
 #endif
 
-#ifdef USE_MRUBY_OLD_BYTE_CODE
+#if MRUBY_RELEASE_NO >= 30000
+#define ci_target_class_set(ci, tc) do { (ci)->u.target_class = (tc); } while (0)
+#else
+#define ci_target_class_set(ci, tc) do { (ci)->target_class = (tc); } while (0)
+#endif
+
+#if MRUBY_RELEASE_NO >= 30100
+#define CI_CCI_DIRECT_P(ci) ((ci)->cci == 2 /* CINFO_DIRECT */)
+#else
+#define CI_CCI_DIRECT_P(ci) ((ci)->acc == -2 /* CI_ACC_DIRECT */)
+#endif
+
+#if MRUBY_RELEASE_NO >= 20000
+#define replace_stop_with_return(mrb, irep) ((void)0)
+#else
 static void
 replace_stop_with_return(mrb_state *mrb, mrb_irep *irep)
 {
@@ -66,146 +60,80 @@ replace_stop_with_return(mrb_state *mrb, mrb_irep *irep)
 }
 #endif
 
-static int
-compile_rb2mrb(mrb_state *mrb0, const char *code, int code_len, const char *path, FILE* tmpfp)
-{
-  mrb_state *mrb = mrb_open();
-  mrb_value result;
-  mrbc_context *c;
-  int ret = -1;
-  int debuginfo = 1;
-  mrb_irep *irep;
-
-  c = mrbc_context_new(mrb);
-  c->no_exec = 1;
-  if (path != NULL) {
-    mrbc_filename(mrb, c, path);
-  }
-
-  result = mrb_load_nstring_cxt(mrb, code, code_len, c);
-  if (mrb_undef_p(result)) {
-    mrbc_context_free(mrb, c);
-    mrb_close(mrb);
-    return MRB_DUMP_GENERAL_FAILURE;
-  }
-
-  irep = mrb_proc_ptr(result)->body.irep;
-  ret = mrb_dump_irep_binary(mrb, irep, debuginfo, tmpfp);
-
-  mrbc_context_free(mrb, c);
-  mrb_close(mrb);
-
-  return ret;
-}
-
 static void
-eval_load_irep(mrb_state *mrb, mrb_irep *irep)
+eval_proc(mrb_state *mrb, mrb_value proc)
 {
-  int ai;
-  struct RProc *proc;
+  replace_stop_with_return(mrb, mrb_proc_ptr(proc)->body.irep);
+  MRB_PROC_SET_TARGET_CLASS(mrb_proc_ptr(proc), mrb->object_class);
 
-#ifdef USE_MRUBY_OLD_BYTE_CODE
-  replace_stop_with_return(mrb, irep);
+#if MRUBY_RELEASE_NO >= 10300
+  if (!CI_CCI_DIRECT_P(mrb->c->ci)) {
+    ci_target_class_set(mrb->c->ci, mrb->object_class);
+    mrb_yield_cont(mrb, proc, mrb_top_self(mrb), 0, NULL);
+    return;
+  }
 #endif
-  proc = mrb_proc_new(mrb, irep);
-  mrb_irep_decref(mrb, irep);
-  MRB_PROC_SET_TARGET_CLASS(proc, mrb->object_class);
 
-  ai = mrb_gc_arena_save(mrb);
-  mrb_yield_with_class(mrb, mrb_obj_value(proc), 0, NULL, mrb_top_self(mrb), mrb->object_class);
-  mrb_gc_arena_restore(mrb, ai);
+  mrb_yield_with_class(mrb, proc, 0, NULL, mrb_top_self(mrb), mrb->object_class);
 }
 
 static mrb_value
-mrb_require_load_rb_str(mrb_state *mrb, mrb_value self)
+mrb_require_load_file_common(mrb_state *mrb, mrb_value (*loader)(mrb_state *, FILE *, mrbc_context *))
 {
   char *path_ptr = NULL;
-#if defined(_WIN32) || defined(_WIN64)
-  char tmpname[MAX_PATH] = "tmp.XXXXXXXX";
-#else
-  char tmpname[] = "tmp.XXXXXXXX";
-#endif
-  mode_t mask;
-  FILE *tmpfp = NULL;
-  int fd = -1, ret;
-  mrb_irep *irep;
-  mrb_value code, path = mrb_nil_value();
+  FILE *fp = NULL;
+  mrb_value proc;
+  mrb_value path;
+  int ai = mrb_gc_arena_save(mrb);
+  mrbc_context *mrbc;
 
-  mrb_get_args(mrb, "S|S", &code, &path);
-  if (!mrb_string_p(path)) {
-    path = mrb_str_new_cstr(mrb, "-");
-  }
+  mrb_get_args(mrb, "S", &path);
   path_ptr = mrb_str_to_cstr(mrb, path);
 
-  mask = umask(077);
-  fd = mkstemp(tmpname);
-  if (fd == -1) {
-    mrb_sys_fail(mrb, "can't create mkstemp() at mrb_require_load_rb_str");
-  }
-  umask(mask);
+  mrbc = mrbc_context_new(mrb);
+  mrbc->no_exec = TRUE;
+  mrbc->capture_errors = TRUE;
+  mrbc_filename(mrb, mrbc, path_ptr);
 
-  tmpfp = fdopen(fd, "r+");
-  if (tmpfp == NULL) {
-    close(fd);
-    mrb_sys_fail(mrb, "can't open temporay file at mrb_require_load_rb_str");
+  fp = fopen(path_ptr, "rb");
+  if (fp == NULL) {
+    mrbc_context_free(mrb, mrbc);
+    mrb_raisef(mrb, E_LOAD_ERROR, "can't open file -- %S", path);
   }
 
-  ret = compile_rb2mrb(mrb, RSTRING_PTR(code), RSTRING_LEN(code), path_ptr, tmpfp);
-  if (ret != MRB_DUMP_OK) {
-    fclose(tmpfp);
-    remove(tmpname);
-    mrb_raisef(mrb, E_LOAD_ERROR, "can't load file -- %S", path);
-    return mrb_nil_value();
-  }
+  proc = loader(mrb, fp, mrbc);
+  fclose(fp);
+  mrbc_context_free(mrb, mrbc);
 
-  rewind(tmpfp);
-  irep = mrb_read_irep_file(mrb, tmpfp);
-  fclose(tmpfp);
-  remove(tmpname);
-
-  if (irep) {
-    eval_load_irep(mrb, irep);
+  if (mrb_proc_p(proc)) {
+    eval_proc(mrb, proc);
   } else if (mrb->exc) {
     // fail to load
-    longjmp(*(jmp_buf*)mrb->jmp, 1);
+    mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
   } else {
     mrb_raisef(mrb, E_LOAD_ERROR, "can't load file -- %S", path);
     return mrb_nil_value();
   }
 
-  return mrb_true_value();
+  mrb_gc_arena_restore(mrb, ai);
+
+  return mrb_top_self(mrb); // used as self in loaded library with mrb_yield_cont()
+}
+
+static mrb_value
+mrb_require_load_rb_file(mrb_state *mrb, mrb_value self)
+{
+  (void)self;
+
+  return mrb_require_load_file_common(mrb, mrb_load_file_cxt);
 }
 
 static mrb_value
 mrb_require_load_mrb_file(mrb_state *mrb, mrb_value self)
 {
-  char *path_ptr = NULL;
-  FILE *fp = NULL;
-  mrb_irep *irep;
-  mrb_value path;
+  (void)self;
 
-  mrb_get_args(mrb, "S", &path);
-  path_ptr = mrb_str_to_cstr(mrb, path);
-
-  fp = fopen(path_ptr, "rb");
-  if (fp == NULL) {
-    mrb_raisef(mrb, E_LOAD_ERROR, "can't open file -- %S", path);
-  }
-
-  irep = mrb_read_irep_file(mrb, fp);
-  fclose(fp);
-
-  if (irep) {
-    eval_load_irep(mrb, irep);
-  } else if (mrb->exc) {
-    // fail to load
-    longjmp(*(jmp_buf*)mrb->jmp, 1);
-  } else {
-    mrb_raisef(mrb, E_LOAD_ERROR, "can't load file -- %S", path);
-    return mrb_nil_value();
-  }
-
-  return mrb_true_value();
+  return mrb_require_load_file_common(mrb, mrb_load_irep_file_cxt);
 }
 
 void
@@ -214,7 +142,7 @@ mrb_mruby_require_gem_init(mrb_state *mrb)
   struct RClass *krn;
   krn = mrb->kernel_module;
 
-  mrb_define_method(mrb, krn, "_load_rb_str",   mrb_require_load_rb_str,   MRB_ARGS_ANY());
+  mrb_define_method(mrb, krn, "_load_rb_file",  mrb_require_load_rb_file,  MRB_ARGS_REQ(1));
   mrb_define_method(mrb, krn, "_load_mrb_file", mrb_require_load_mrb_file, MRB_ARGS_REQ(1));
 }
 

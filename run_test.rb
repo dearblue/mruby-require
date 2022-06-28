@@ -16,6 +16,8 @@ if __FILE__ == $0
   exit system(%Q[cd #{dir}; MRUBY_CONFIG=#{File.expand_path __FILE__} ruby minirake #{build_args.join(' ')}])
 end
 
+MRuby::Lockfile.disable rescue nil
+
 MRuby::Build.new do |conf|
   toolchain :gcc
   conf.gembox 'default'
@@ -23,10 +25,11 @@ MRuby::Build.new do |conf|
   enable_debug
   enable_test
 
-  conf.gem :core => 'mruby-eval'
-  conf.gem :core => 'mruby-io'
-  conf.gem :git => 'https://github.com/iij/mruby-dir.git'
-  conf.gem :git => 'https://github.com/iij/mruby-tempfile.git'
-
   conf.gem File.expand_path(File.dirname(__FILE__))
+
+  # MRuby::Source::MRUBY_RELEASE_NO is defined by mruby-require/mrbgem.rake.
+  unless defined?(MRuby::Source::MRUBY_RELEASE_NO) && MRuby::Source::MRUBY_RELEASE_NO >= 10400
+    # Clarify that github: 'iij/mruby-io' is used (for older than mruby-1.4.0)
+    conf.gem github: 'iij/mruby-io'
+  end
 end
